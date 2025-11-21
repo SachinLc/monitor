@@ -1,18 +1,13 @@
 name: PU Scholarship Monitor
 
 on:
-  # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
-
-  # Runs the job automatically every 6 hours
   schedule:
     - cron: '0 */6 * * *'
 
 jobs:
   monitor-notices:
     runs-on: ubuntu-latest
-
-    # Grant permissions for the job to write to the repository
     permissions:
       contents: write
 
@@ -38,17 +33,26 @@ jobs:
       
       - name: Commit and push state file if changed
         run: |
+          # Configure git user
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
           
-          # Add the state file to the staging area
-          git add -f state/counts.json
+          # --- FIX ---
+          # 1. Define the correct state file path from your python script
+          STATE_FILE="state/notices.json"
           
-          # Commit and push only if there are changes
-          # The "git diff" command prevents empty commits and workflow loops
-          if ! git diff --staged --quiet; then
-            git commit -m "Update month counts state"
-            git push
-          else
+          # 2. Check if the file was actually created before trying to commit it
+          if [ ! -f "$STATE_FILE" ]; then
+            echo "State file not found. Skipping commit."
+            exit 0
+          fi
+          
+          # 3. Proceed to add, commit, and push only if the file exists and has changes
+          git add -f "$STATE_FILE"
+          
+          if git diff --staged --quiet; then
             echo "No changes to the state file to commit."
+          else
+            git commit -m "Update notices state"
+            git push
           fi
