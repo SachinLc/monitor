@@ -1,7 +1,5 @@
 import os
-import re
 import json
-from collections import Counter
 from datetime import datetime
 import requests
 from bs4 import BeautifulSoup
@@ -12,11 +10,7 @@ load_dotenv()
 
 # --- Configuration ---
 NOTICES_URL = "https://pu.edu.np/notices/"
-STATE_FILE_PATH = "state/counts.json"
-MONTHS = [
-    "jan", "feb", "mar", "apr", "may", "jun",
-    "jul", "aug", "sep", "oct", "nov", "dec"
-]
+STATE_FILE_PATH = "state/notices.json"
 
 # --- Telegram Configuration ---
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -45,52 +39,41 @@ def send_telegram_message(message):
     except Exception as e:
         print(f"ERROR: An exception occurred while sending Telegram message: {e}")
 
-def get_previous_counts():
-    """Reads the last known month counts from the state file."""
-    print(f"LOG: Reading previous counts from '{STATE_FILE_PATH}'...")
+def get_previous_notices():
+    """Reads the last known list of notice identifiers from the state file."""
+    print(f"LOG: Reading previous notices from '{STATE_FILE_PATH}'...")
     try:
         with open(STATE_FILE_PATH, 'r') as f:
             data = json.load(f)
-            print(f"LOG: Successfully loaded previous counts: {data}")
-            return data
+            print(f"LOG: Successfully loaded {len(data)} previous notices.")
+            return set(data)
     except FileNotFoundError:
         print("LOG: State file not found. Assuming this is the first run.")
-        return {}
+        return set()
     except json.JSONDecodeError:
         print("ERROR: State file is corrupted or empty. Starting fresh.")
-        return {}
+        return set()
 
-def save_current_counts(counts):
-    """Saves the current month counts to the state file."""
-    print(f"LOG: Saving current counts to '{STATE_FILE_PATH}': {counts}")
-    # Ensure the directory exists
+def save_current_notices(notices_set):
+    """Saves the current list of notice identifiers to the state file."""
+    print(f"LOG: Saving {len(notices_set)} current notices to '{STATE_FILE_PATH}'...")
     os.makedirs(os.path.dirname(STATE_FILE_PATH), exist_ok=True)
     with open(STATE_FILE_PATH, 'w') as f:
-        json.dump(counts, f, indent=2)
+        # Convert set to list for JSON serialization
+        json.dump(list(notices_set), f, indent=2)
     print("LOG: Save complete.")
-
-def format_changes(previous, current):
-    """Creates a human-readable string detailing the changes."""
-    all_keys = sorted(list(set(previous.keys()) | set(current.keys())))
-    changes = []
-    for key in all_keys:
-        old_val = previous.get(key, 0)
-        new_val = current.get(key, 0)
-        if old_val != new_val:
-            changes.append(f"• <b>{key.capitalize()}</b>: {old_val} → <b>{new_val}</b>")
-    return "\n".join(changes) if changes else "No specific count changes detected."
 
 def check_for_updates():
     """Main function to perform the check-and-notify process."""
     print(f"\n--- SCRIPT START: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
 
     # 1. Get previous state
-    previous_counts = get_previous_counts()
+    previous_notices_set = get_previous_notices()
 
     # 2. Fetch live website content
     print(f"LOG: Fetching content from {NOTICES_URL}...")
     try:
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+        headers = {'User-Agent': 'Mozilla/5.0'}
         response = requests.get(NOTICES_URL, headers=headers, timeout=20)
         response.raise_for_status()
         print("LOG: Website fetched successfully.")
@@ -98,46 +81,62 @@ def check_for_updates():
         print(f"FATAL ERROR: Could not fetch the website. Stopping script. Reason: {e}")
         return
 
-    # 3. Parse HTML and find all month occurrences
+    # 3. Parse HTML and extract unique notice identifiers
     soup = BeautifulSoup(response.text, 'html.parser')
-    page_text = soup.body.get_text(separator=' ', strip=True).lower()
+    current_notices_set = set()
     
-    # Regex to find all 3-letter month abbreviations
-    month_pattern = r'\b(' + '|'.join(MONTHS) + r')\b'
-    found_months = re.findall(month_pattern, page_text)
-    
-    current_counts = dict(Counter(found_months))
-    print(f"LOG: Found current month counts: {current_counts}")
+    # Find all notice blocks. This selector targets the list items containing notices.
+    # We inspect the page to find that notices are in `<li>` tags inside a `<ul>` with class `list-unstyled`.
+    notice_list = soup.select("ul.list-unstyled li")
+    if not notice_list:
+        print("ERROR: Could not find the notice list on the page. The website structure might have changed.")
+        return
+
+    for item in notice_list:
+        title_tag = item.find('a')
+        date_tag = item.find('span')
+        
+        if title_tag and date_tag:
+            # Clean up the text and create a unique identifier
+            title = " ".join(title_tag.get_text(strip=True).split())
+            date = " ".join(date_tag.get_text(strip=True).split())
+            unique_id = f"{title} - {date}"
+            current_notices_set.add(unique_id)
+            
+    print(f"LOG: Found {len(current_notices_set)} unique notices on the page.")
 
     # 4. Compare current state with previous state
-    if not previous_counts and current_counts:
-        # First successful run
-        print("LOG: First run. Initializing state and sending welcome message.")
-        message = (
-            "✅ **PU Monitor Initialized**\n\n"
-            "The monitor is now active and has successfully fetched the initial month counts.\n\n"
-            "<b>Initial Counts:</b>\n"
-            f"```{json.dumps(current_counts, indent=2)}```\n\n"
-            f"You will be notified of any future changes.\n"
-            f"Page: {NOTICES_URL}"
-        )
-        send_telegram_message(message)
-    elif previous_counts != current_counts:
-        print("LOG: Change detected! Preparing notification.")
-        changes_summary = format_changes(previous_counts, current_counts)
-        message = (
-            "🚨 **PU Notices Update Detected** 🚨\n\n"
-            "The month counts on the notices page have changed, indicating new or removed notices.\n\n"
-            "<b>Changes:</b>\n"
-            f"{changes_summary}\n\n"
-            f"View the notices page for details:\n{NOTICES_URL}"
-        )
-        send_telegram_message(message)
+    if previous_notices_set == current_notices_set:
+        print("LOG: No changes detected. The list of notices is identical to the last run.")
     else:
-        print("LOG: No changes detected. No notification will be sent.")
+        new_notices = current_notices_set - previous_notices_set
+        
+        if not previous_notices_set:
+            # First successful run
+            print("LOG: First run. Initializing state and sending welcome message.")
+            message = (
+                "✅ **PU Monitor Initialized**\n\n"
+                "The monitor is now active and has fetched the initial list of notices. "
+                "You will be notified of any future changes."
+            )
+            send_telegram_message(message)
+        else:
+            print(f"LOG: Change detected! New notices: {len(new_notices)}")
+            if new_notices:
+                # Format the list of new notices for the message
+                new_notices_str = "\n".join([f"• {notice}" for notice in sorted(list(new_notices))])
+                message = (
+                    "🚨 **New PU Notice(s) Detected** 🚨\n\n"
+                    "The following new notice(s) have been published:\n\n"
+                    f"<b>{new_notices_str}</b>\n\n"
+                    f"View all notices here:\n{NOTICES_URL}"
+                )
+                send_telegram_message(message)
+            else:
+                print("LOG: Notices were removed, but no new ones were added. No notification sent.")
 
     # 5. Save the new state for the next run
-    save_current_counts(current_counts)
+    save_current_notices(current_notices_set)
     
     print(f"--- SCRIPT END: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
 
