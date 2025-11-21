@@ -59,7 +59,6 @@ def save_current_notices(notices_set):
     print(f"LOG: Saving {len(notices_set)} current notices to '{STATE_FILE_PATH}'...")
     os.makedirs(os.path.dirname(STATE_FILE_PATH), exist_ok=True)
     with open(STATE_FILE_PATH, 'w') as f:
-        # Convert set to list for JSON serialization
         json.dump(list(notices_set), f, indent=2)
     print("LOG: Save complete.")
 
@@ -73,7 +72,7 @@ def check_for_updates():
     # 2. Fetch live website content
     print(f"LOG: Fetching content from {NOTICES_URL}...")
     try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
         response = requests.get(NOTICES_URL, headers=headers, timeout=20)
         response.raise_for_status()
         print("LOG: Website fetched successfully.")
@@ -85,25 +84,43 @@ def check_for_updates():
     soup = BeautifulSoup(response.text, 'html.parser')
     current_notices_set = set()
     
-    # Find all notice blocks. This selector targets the list items containing notices.
-    # We inspect the page to find that notices are in `<li>` tags inside a `<ul>` with class `list-unstyled`.
-    notice_list = soup.select("ul.list-unstyled li")
+    # --- IMPROVED SELECTOR AND LOGGING ---
+    # This selector is more general and looks for any list item within a div that seems to contain the notices.
+    notice_list = soup.select(".card-body ul li") 
+    
     if not notice_list:
-        print("ERROR: Could not find the notice list on the page. The website structure might have changed.")
-        return
+        print("ERROR: Could not find any notice list items using the selector '.card-body ul li'. The website structure has likely changed.")
+        # Attempt a broader fallback selector
+        print("LOG: Attempting a broader fallback selector 'ul li'...")
+        notice_list = soup.select("ul li")
+        if not notice_list:
+            print("ERROR: Fallback selector also failed. The page structure is unrecognized. Stopping script.")
+            return
 
-    for item in notice_list:
+    print(f"LOG: Found {len(notice_list)} potential notice items. Parsing them now...")
+    
+    for i, item in enumerate(notice_list):
         title_tag = item.find('a')
         date_tag = item.find('span')
         
         if title_tag and date_tag:
-            # Clean up the text and create a unique identifier
             title = " ".join(title_tag.get_text(strip=True).split())
             date = " ".join(date_tag.get_text(strip=True).split())
-            unique_id = f"{title} - {date}"
-            current_notices_set.add(unique_id)
             
-    print(f"LOG: Found {len(current_notices_set)} unique notices on the page.")
+            # A simple filter to avoid parsing navigation links etc.
+            if len(date) < 25 and any(char.isdigit() for char in date):
+                unique_id = f"{title} - {date}"
+                current_notices_set.add(unique_id)
+            else:
+                print(f"LOG: Skipping item #{i+1} as it does not look like a valid notice (Date: '{date}')")
+        else:
+            print(f"LOG: Skipping item #{i+1} as it's missing a title or date tag.")
+            
+    if not current_notices_set:
+        print("ERROR: Parsed the page but could not extract any valid notices. Please check the HTML structure and selectors.")
+        return # Exit if we found nothing, to avoid overwriting good state with empty state
+
+    print(f"LOG: Successfully extracted {len(current_notices_set)} unique notices.")
 
     # 4. Compare current state with previous state
     if previous_notices_set == current_notices_set:
@@ -111,29 +128,26 @@ def check_for_updates():
     else:
         new_notices = current_notices_set - previous_notices_set
         
-        if not previous_notices_set:
-            # First successful run
-            print("LOG: First run. Initializing state and sending welcome message.")
+        if not previous_notices_set and current_notices_set:
+            print("LOG: First run or state was empty. Initializing state.")
             message = (
                 "✅ **PU Monitor Initialized**\n\n"
                 "The monitor is now active and has fetched the initial list of notices. "
                 "You will be notified of any future changes."
             )
             send_telegram_message(message)
-        else:
+        elif new_notices:
             print(f"LOG: Change detected! New notices: {len(new_notices)}")
-            if new_notices:
-                # Format the list of new notices for the message
-                new_notices_str = "\n".join([f"• {notice}" for notice in sorted(list(new_notices))])
-                message = (
-                    "🚨 **New PU Notice(s) Detected** 🚨\n\n"
-                    "The following new notice(s) have been published:\n\n"
-                    f"<b>{new_notices_str}</b>\n\n"
-                    f"View all notices here:\n{NOTICES_URL}"
-                )
-                send_telegram_message(message)
-            else:
-                print("LOG: Notices were removed, but no new ones were added. No notification sent.")
+            new_notices_str = "\n".join([f"• {notice}" for notice in sorted(list(new_notices))])
+            message = (
+                "🚨 **New PU Notice(s) Detected** 🚨\n\n"
+                "The following new notice(s) have been published:\n\n"
+                f"<b>{new_notices_str}</b>\n\n"
+                f"View all notices here:\n{NOTICES_URL}"
+            )
+            send_telegram_message(message)
+        else:
+            print("LOG: Change detected, but it appears notices were removed, not added. No notification sent.")
 
     # 5. Save the new state for the next run
     save_current_notices(current_notices_set)
