@@ -1,4 +1,5 @@
 import os
+import re
 import json
 from datetime import datetime
 import requests
@@ -10,7 +11,7 @@ load_dotenv()
 
 # --- Configuration ---
 NOTICES_URL = "https://pu.edu.np/notices/"
-STATE_FILE_PATH = "state/notices.json"
+STATE_FILE_PATH = "state/dates.json" # Changed to track dates
 
 # --- Telegram Configuration ---
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -39,35 +40,51 @@ def send_telegram_message(message):
     except Exception as e:
         print(f"ERROR: An exception occurred while sending Telegram message: {e}")
 
-def get_previous_notices():
-    """Reads the last known list of notice identifiers from the state file."""
-    print(f"LOG: Reading previous notices from '{STATE_FILE_PATH}'...")
+def get_previous_dates():
+    """Reads the last known list of dates from the state file."""
+    print(f"LOG: Reading previous dates from '{STATE_FILE_PATH}'...")
     try:
         with open(STATE_FILE_PATH, 'r') as f:
             data = json.load(f)
-            print(f"LOG: Successfully loaded {len(data)} previous notices.")
-            return set(data)
+            print(f"LOG: Successfully loaded {len(data)} previous dates.")
+            return data
     except FileNotFoundError:
         print("LOG: State file not found. Assuming this is the first run.")
-        return set()
+        return []
     except json.JSONDecodeError:
         print("ERROR: State file is corrupted or empty. Starting fresh.")
-        return set()
+        return []
 
-def save_current_notices(notices_set):
-    """Saves the current list of notice identifiers to the state file."""
-    print(f"LOG: Saving {len(notices_set)} current notices to '{STATE_FILE_PATH}'...")
+def save_current_dates(dates):
+    """Saves the current list of dates to the state file."""
+    print(f"LOG: Saving {len(dates)} current dates to '{STATE_FILE_PATH}'...")
     os.makedirs(os.path.dirname(STATE_FILE_PATH), exist_ok=True)
     with open(STATE_FILE_PATH, 'w') as f:
-        json.dump(list(notices_set), f, indent=2)
+        json.dump(dates, f, indent=2)
     print("LOG: Save complete.")
+
+def format_changes(previous_list, current_list):
+    """Creates a human-readable string detailing added and removed dates."""
+    previous_set = set(previous_list)
+    current_set = set(current_list)
+    
+    added = sorted(list(current_set - previous_set), reverse=True)
+    removed = sorted(list(previous_set - current_set), reverse=True)
+    
+    message_parts = []
+    if added:
+        message_parts.append("<b>✅ New Notices Found:</b>\n" + "\n".join(f"  • {d}" for d in added))
+    if removed:
+        message_parts.append("<b>❌ Old Notices Removed:</b>\n" + "\n".join(f"  • {d}" for d in removed))
+        
+    return "\n\n".join(message_parts)
 
 def check_for_updates():
     """Main function to perform the check-and-notify process."""
     print(f"\n--- SCRIPT START: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
 
     # 1. Get previous state
-    previous_notices_set = get_previous_notices()
+    previous_dates = get_previous_dates()
 
     # 2. Fetch live website content
     print(f"LOG: Fetching content from {NOTICES_URL}...")
@@ -80,77 +97,46 @@ def check_for_updates():
         print(f"FATAL ERROR: Could not fetch the website. Stopping script. Reason: {e}")
         return
 
-    # 3. Parse HTML and extract unique notice identifiers
+    # 3. Parse HTML and extract all full dates
     soup = BeautifulSoup(response.text, 'html.parser')
-    current_notices_set = set()
+    page_text = soup.body.get_text(separator=' ', strip=True)
     
-    # --- IMPROVED SELECTOR AND LOGGING ---
-    # This selector is more general and looks for any list item within a div that seems to contain the notices.
-    notice_list = soup.select(".card-body ul li") 
+    # Regex to find dates like "20 Nov 2025". This is the core of the fix.
+    date_pattern = r'\b(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4})\b'
+    found_dates = re.findall(date_pattern, page_text, re.IGNORECASE)
     
-    if not notice_list:
-        print("ERROR: Could not find any notice list items using the selector '.card-body ul li'. The website structure has likely changed.")
-        # Attempt a broader fallback selector
-        print("LOG: Attempting a broader fallback selector 'ul li'...")
-        notice_list = soup.select("ul li")
-        if not notice_list:
-            print("ERROR: Fallback selector also failed. The page structure is unrecognized. Stopping script.")
-            return
-
-    print(f"LOG: Found {len(notice_list)} potential notice items. Parsing them now...")
-    
-    for i, item in enumerate(notice_list):
-        title_tag = item.find('a')
-        date_tag = item.find('span')
-        
-        if title_tag and date_tag:
-            title = " ".join(title_tag.get_text(strip=True).split())
-            date = " ".join(date_tag.get_text(strip=True).split())
-            
-            # A simple filter to avoid parsing navigation links etc.
-            if len(date) < 25 and any(char.isdigit() for char in date):
-                unique_id = f"{title} - {date}"
-                current_notices_set.add(unique_id)
-            else:
-                print(f"LOG: Skipping item #{i+1} as it does not look like a valid notice (Date: '{date}')")
-        else:
-            print(f"LOG: Skipping item #{i+1} as it's missing a title or date tag.")
-            
-    if not current_notices_set:
-        print("ERROR: Parsed the page but could not extract any valid notices. Please check the HTML structure and selectors.")
-        return # Exit if we found nothing, to avoid overwriting good state with empty state
-
-    print(f"LOG: Successfully extracted {len(current_notices_set)} unique notices.")
+    # Create a canonical (sorted, unique) list of dates for reliable comparison
+    current_dates = sorted(list(set(found_dates)))
+    print(f"LOG: Found {len(current_dates)} unique dates on the page.")
 
     # 4. Compare current state with previous state
-    if previous_notices_set == current_notices_set:
-        print("LOG: No changes detected. The list of notices is identical to the last run.")
+    if not previous_dates and current_dates:
+        # First successful run
+        print("LOG: First run. Initializing state and sending welcome message.")
+        message = (
+            "✅ **PU Monitor Initialized**\n\n"
+            "The monitor is now active and will track specific notice dates.\n\n"
+            f"<b>Found {len(current_dates)} notices:</b>\n" +
+            "\n".join(f"  • {d}" for d in current_dates[:15]) + # Show a sample
+            (f"\n  • ...and {len(current_dates) - 15} more." if len(current_dates) > 15 else "") +
+            f"\n\nPage: {NOTICES_URL}"
+        )
+        send_telegram_message(message)
+    elif previous_dates != current_dates:
+        print("LOG: Change detected! Preparing notification.")
+        changes_summary = format_changes(previous_dates, current_dates)
+        message = (
+            "🚨 **PU Notices Update Detected** 🚨\n\n"
+            "The list of notices on the page has changed.\n\n"
+            f"{changes_summary}\n\n"
+            f"View the notices page for details:\n{NOTICES_URL}"
+        )
+        send_telegram_message(message)
     else:
-        new_notices = current_notices_set - previous_notices_set
-        
-        if not previous_notices_set and current_notices_set:
-            print("LOG: First run or state was empty. Initializing state.")
-            message = (
-                "✅ **PU Monitor Initialized**\n\n"
-                "The monitor is now active and has fetched the initial list of notices. "
-                "You will be notified of any future changes."
-            )
-            send_telegram_message(message)
-        elif new_notices:
-            print(f"LOG: Change detected! New notices: {len(new_notices)}")
-            new_notices_str = "\n".join([f"• {notice}" for notice in sorted(list(new_notices))])
-            message = (
-                "🚨 **New PU Notice(s) Detected** 🚨\n\n"
-                "The following new notice(s) have been published:\n\n"
-                f"<b>{new_notices_str}</b>\n\n"
-                f"View all notices here:\n{NOTICES_URL}"
-            )
-            send_telegram_message(message)
-        else:
-            print("LOG: Change detected, but it appears notices were removed, not added. No notification sent.")
+        print("LOG: No changes detected. The list of notice dates is identical.")
 
     # 5. Save the new state for the next run
-    save_current_notices(current_notices_set)
+    save_current_dates(current_dates)
     
     print(f"--- SCRIPT END: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
 
