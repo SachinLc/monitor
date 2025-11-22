@@ -1,6 +1,7 @@
 import os
 import re
 import json
+from collections import Counter
 from datetime import datetime
 import requests
 from bs4 import BeautifulSoup
@@ -11,7 +12,8 @@ load_dotenv()
 
 # --- Configuration ---
 NOTICES_URL = "https://pu.edu.np/notices/"
-STATE_FILE_PATH = "state/dates.json" # Changed to track dates
+# The state file will now store counts of each unique date
+STATE_FILE_PATH = "state/date_counts.json" 
 
 # --- Telegram Configuration ---
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -33,58 +35,59 @@ def send_telegram_message(message):
     
     try:
         response = requests.post(api_url, data=payload, timeout=10)
-        if response.status_code == 200:
-            print("LOG: Successfully sent Telegram notification.")
-        else:
-            print(f"ERROR: Telegram API returned status {response.status_code}: {response.text}")
-    except Exception as e:
-        print(f"ERROR: An exception occurred while sending Telegram message: {e}")
+        response.raise_for_status()
+        print("LOG: Successfully sent Telegram notification.")
+    except requests.exceptions.RequestException as e:
+        print(f"ERROR: Telegram API request failed: {e}")
 
-def get_previous_dates():
-    """Reads the last known list of dates from the state file."""
-    print(f"LOG: Reading previous dates from '{STATE_FILE_PATH}'...")
+def get_previous_counts():
+    """Reads the last known date counts from the state file."""
+    print(f"LOG: Reading previous date counts from '{STATE_FILE_PATH}'...")
     try:
         with open(STATE_FILE_PATH, 'r') as f:
             data = json.load(f)
-            print(f"LOG: Successfully loaded {len(data)} previous dates.")
+            print(f"LOG: Successfully loaded previous counts for {len(data)} dates.")
             return data
     except FileNotFoundError:
         print("LOG: State file not found. Assuming this is the first run.")
-        return []
+        return {}
     except json.JSONDecodeError:
         print("ERROR: State file is corrupted or empty. Starting fresh.")
-        return []
+        return {}
 
-def save_current_dates(dates):
-    """Saves the current list of dates to the state file."""
-    print(f"LOG: Saving {len(dates)} current dates to '{STATE_FILE_PATH}'...")
+def save_current_counts(counts):
+    """Saves the current date counts to the state file."""
+    print(f"LOG: Saving current counts for {len(counts)} dates to '{STATE_FILE_PATH}'...")
     os.makedirs(os.path.dirname(STATE_FILE_PATH), exist_ok=True)
     with open(STATE_FILE_PATH, 'w') as f:
-        json.dump(dates, f, indent=2)
+        json.dump(counts, f, indent=2, sort_keys=True)
     print("LOG: Save complete.")
 
-def format_changes(previous_list, current_list):
-    """Creates a human-readable string detailing added and removed dates."""
-    previous_set = set(previous_list)
-    current_set = set(current_list)
+def format_changes(previous, current):
+    """Creates a human-readable string detailing changes in date counts."""
+    all_dates = sorted(list(set(previous.keys()) | set(current.keys())), reverse=True)
     
-    added = sorted(list(current_set - previous_set), reverse=True)
-    removed = sorted(list(previous_set - current_set), reverse=True)
-    
-    message_parts = []
-    if added:
-        message_parts.append("<b>✅ New Notices Found:</b>\n" + "\n".join(f"  • {d}" for d in added))
-    if removed:
-        message_parts.append("<b>❌ Old Notices Removed:</b>\n" + "\n".join(f"  • {d}" for d in removed))
+    changes = []
+    for date in all_dates:
+        old_count = previous.get(date, 0)
+        new_count = current.get(date, 0)
         
-    return "\n\n".join(message_parts)
+        if old_count != new_count:
+            if old_count == 0:
+                changes.append(f"✅ <b>New:</b> {date} (Count: {new_count})")
+            elif new_count == 0:
+                changes.append(f"❌ <b>Removed:</b> {date} (Was: {old_count})")
+            else:
+                changes.append(f"🔄 <b>Changed:</b> {date} (Count: {old_count} → <b>{new_count}</b>)")
+                
+    return "\n".join(changes)
 
 def check_for_updates():
     """Main function to perform the check-and-notify process."""
     print(f"\n--- SCRIPT START: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
 
     # 1. Get previous state
-    previous_dates = get_previous_dates()
+    previous_counts = get_previous_counts()
 
     # 2. Fetch live website content
     print(f"LOG: Fetching content from {NOTICES_URL}...")
@@ -97,46 +100,44 @@ def check_for_updates():
         print(f"FATAL ERROR: Could not fetch the website. Stopping script. Reason: {e}")
         return
 
-    # 3. Parse HTML and extract all full dates
+    # 3. Parse HTML and COUNT all full dates
     soup = BeautifulSoup(response.text, 'html.parser')
     page_text = soup.body.get_text(separator=' ', strip=True)
     
-    # Regex to find dates like "20 Nov 2025". This is the core of the fix.
     date_pattern = r'\b(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4})\b'
     found_dates = re.findall(date_pattern, page_text, re.IGNORECASE)
     
-    # Create a canonical (sorted, unique) list of dates for reliable comparison
-    current_dates = sorted(list(set(found_dates)))
-    print(f"LOG: Found {len(current_dates)} unique dates on the page.")
+    # Use Counter to get a dictionary of date -> count. This is the main fix.
+    current_counts = dict(Counter(found_dates))
+    print(f"LOG: Found {len(found_dates)} total notices across {len(current_counts)} unique dates.")
 
-    # 4. Compare current state with previous state
-    if not previous_dates and current_dates:
+    # 4. Compare current counts with previous counts
+    if not previous_counts and current_counts:
         # First successful run
         print("LOG: First run. Initializing state and sending welcome message.")
         message = (
             "✅ **PU Monitor Initialized**\n\n"
-            "The monitor is now active and will track specific notice dates.\n\n"
-            f"<b>Found {len(current_dates)} notices:</b>\n" +
-            "\n".join(f"  • {d}" for d in current_dates[:15]) + # Show a sample
-            (f"\n  • ...and {len(current_dates) - 15} more." if len(current_dates) > 15 else "") +
-            f"\n\nPage: {NOTICES_URL}"
+            "The monitor is now active and will track the count of each notice date.\n\n"
+            f"<b>Initial counts found:</b>\n"
+            f"```{json.dumps(current_counts, indent=2, sort_keys=True)}```\n\n"
+            f"Page: {NOTICES_URL}"
         )
         send_telegram_message(message)
-    elif previous_dates != current_dates:
+    elif previous_counts != current_counts:
         print("LOG: Change detected! Preparing notification.")
-        changes_summary = format_changes(previous_dates, current_dates)
+        changes_summary = format_changes(previous_counts, current_counts)
         message = (
             "🚨 **PU Notices Update Detected** 🚨\n\n"
-            "The list of notices on the page has changed.\n\n"
+            "The list or count of notices on the page has changed.\n\n"
             f"{changes_summary}\n\n"
             f"View the notices page for details:\n{NOTICES_URL}"
         )
         send_telegram_message(message)
     else:
-        print("LOG: No changes detected. The list of notice dates is identical.")
+        print("LOG: No changes detected. The date counts are identical.")
 
     # 5. Save the new state for the next run
-    save_current_dates(current_dates)
+    save_current_counts(current_counts)
     
     print(f"--- SCRIPT END: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
 
