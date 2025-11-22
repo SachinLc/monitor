@@ -12,8 +12,8 @@ load_dotenv()
 
 # --- Configuration ---
 NOTICES_URL = "https://pu.edu.np/notices/"
-# The state file will now store counts of each unique date
-STATE_FILE_PATH = "state/date_counts.json" 
+# The state file will now be created in the main (root) directory
+STATE_FILE_PATH = "date_counts.json" 
 
 # --- Telegram Configuration ---
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -58,7 +58,7 @@ def get_previous_counts():
 def save_current_counts(counts):
     """Saves the current date counts to the state file."""
     print(f"LOG: Saving current counts for {len(counts)} dates to '{STATE_FILE_PATH}'...")
-    os.makedirs(os.path.dirname(STATE_FILE_PATH), exist_ok=True)
+    # No longer need to create a directory, saving to root.
     with open(STATE_FILE_PATH, 'w') as f:
         json.dump(counts, f, indent=2, sort_keys=True)
     print("LOG: Save complete.")
@@ -86,10 +86,8 @@ def check_for_updates():
     """Main function to perform the check-and-notify process."""
     print(f"\n--- SCRIPT START: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
 
-    # 1. Get previous state
     previous_counts = get_previous_counts()
 
-    # 2. Fetch live website content
     print(f"LOG: Fetching content from {NOTICES_URL}...")
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
@@ -100,20 +98,16 @@ def check_for_updates():
         print(f"FATAL ERROR: Could not fetch the website. Stopping script. Reason: {e}")
         return
 
-    # 3. Parse HTML and COUNT all full dates
     soup = BeautifulSoup(response.text, 'html.parser')
     page_text = soup.body.get_text(separator=' ', strip=True)
     
     date_pattern = r'\b(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4})\b'
     found_dates = re.findall(date_pattern, page_text, re.IGNORECASE)
     
-    # Use Counter to get a dictionary of date -> count. This is the main fix.
     current_counts = dict(Counter(found_dates))
     print(f"LOG: Found {len(found_dates)} total notices across {len(current_counts)} unique dates.")
 
-    # 4. Compare current counts with previous counts
     if not previous_counts and current_counts:
-        # First successful run
         print("LOG: First run. Initializing state and sending welcome message.")
         message = (
             "✅ **PU Monitor Initialized**\n\n"
@@ -136,7 +130,6 @@ def check_for_updates():
     else:
         print("LOG: No changes detected. The date counts are identical.")
 
-    # 5. Save the new state for the next run
     save_current_counts(current_counts)
     
     print(f"--- SCRIPT END: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
